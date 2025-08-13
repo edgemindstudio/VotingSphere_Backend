@@ -1,6 +1,7 @@
-# dotenv
+# ignore real env files
 .env
-**/.env
-*.env
+.env.local
 .env.*
-!.env.example.env
+# but track the template
+!.env.example
+

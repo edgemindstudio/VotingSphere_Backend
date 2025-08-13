@@ -1,9 +1,10 @@
 # voting/models.py
 
 from django.db import models
-from django.conf import settings # Correct (uses settings.AUTH_USER_MODEL)
+from django.conf import settings  # uses settings.AUTH_USER_MODEL
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.db.models import Q  # NEW: for conditional unique constraints
 
 
 class Election(models.Model):
@@ -22,7 +23,7 @@ class Election(models.Model):
         default=False,
         help_text="If true, results are visible immediately after voting; otherwise, only after the election ends."
     )
-    allow_vote_comments = models.BooleanField(  # ✅ keep only this one
+    allow_vote_comments = models.BooleanField(
         default=False,
         help_text="If true, users can (or must) add a comment when voting."
     )
@@ -57,18 +58,38 @@ class Candidate(models.Model):
 
 
 class Vote(models.Model):
-    voter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, null=True, blank=True)
-    candidate = models.ForeignKey(Candidate, on_delete=models.CASCADE)
     election = models.ForeignKey(Election, on_delete=models.CASCADE)
-    comment = models.TextField(blank=True, null=True)  # ✅ correct place
+    candidate = models.ForeignKey(Candidate, on_delete=models.CASCADE)
+    voter = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, null=True, blank=True)
+    comment = models.TextField(blank=True, null=True)
     timestamp = models.DateTimeField(auto_now_add=True)
 
+    # NEW: used to dedupe anonymous voters (and we can store it for authed voters too)
+    device_fingerprint = models.CharField(
+        max_length=64, null=True, blank=True, db_index=True,
+        help_text="Opaque client identifier used to prevent duplicate anonymous votes."
+    )
+
     class Meta:
-        unique_together = ('voter', 'election')
+        constraints = [
+            # One vote per logged-in user per election
+            models.UniqueConstraint(
+                fields=['election', 'voter'],
+                name='uniq_vote_per_user',
+                condition=Q(voter__isnull=False),
+            ),
+            # One vote per device per election (for guests / when fingerprint present)
+            models.UniqueConstraint(
+                fields=['election', 'device_fingerprint'],
+                name='uniq_vote_per_device',
+                condition=Q(device_fingerprint__isnull=False),
+            ),
+        ]
 
     def __str__(self):
-        voter_name = self.voter.username if self.voter else "Anonymous"
+        voter_name = getattr(self.voter, 'username', None) or "Anonymous"
         return f"{voter_name} → {self.candidate.name}"
+
 
 class Category(models.Model):
     name = models.CharField(max_length=100, unique=True)
@@ -91,7 +112,7 @@ class VoteAuditLog(models.Model):
     comment_snapshot = models.TextField(blank=True, null=True)
 
     def __str__(self):
-        voter_name = self.voter.username if self.voter else "Anonymous"
+        voter_name = getattr(self.voter, 'username', None) or "Anonymous"
         return f"[{self.timestamp}] {self.action.upper()} by {voter_name} for {self.candidate.name}"
 
 

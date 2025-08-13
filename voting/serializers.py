@@ -3,12 +3,15 @@
 from rest_framework import serializers
 from .models import Election, Candidate, Vote, Category, Notification
 
+
+# ---------- Categories ----------
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
         fields = ['id', 'name']
 
 
+# ---------- Candidates ----------
 class CandidateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Candidate
@@ -26,19 +29,24 @@ class CandidateSerializer(serializers.ModelSerializer):
         return data
 
 
+# ---------- Elections ----------
 class ElectionSerializer(serializers.ModelSerializer):
     candidates = CandidateSerializer(many=True, read_only=True)
-    category = serializers.SlugRelatedField(
-        slug_field='name',
+
+    # CHANGED: accept category by primary key (id) for writes
+    category = serializers.PrimaryKeyRelatedField(
         queryset=Category.objects.all(),
         required=False,
-        allow_null=True
+        allow_null=True,
     )
+    # Optional convenience: include the category name in responses
+    category_name = serializers.CharField(source='category.name', read_only=True)
 
     class Meta:
         model = Election
         fields = [
-            'id', 'title', 'description', 'category',
+            'id', 'title', 'description',
+            'category', 'category_name',
             'start_date', 'end_date', 'show_results_immediately',
             'allow_anonymous', 'allow_vote_comments',
             'creator', 'created_at', 'candidates', 'is_flagged', 'is_reviewed'
@@ -54,14 +62,41 @@ class ElectionSerializer(serializers.ModelSerializer):
         return data
 
 
+# ---------- Votes ----------
 class VoteSerializer(serializers.ModelSerializer):
+    # Accept the fingerprint the frontend sends (used to dedupe guests)
+    device_fingerprint = serializers.CharField(
+        max_length=64, allow_blank=True, required=False
+    )
+
     class Meta:
         model = Vote
-        fields = ['id', 'voter', 'candidate', 'election', 'timestamp', 'comment']
+        fields = [
+            'id',
+            'voter',
+            'candidate',
+            'election',
+            'timestamp',
+            'comment',
+            'device_fingerprint',
+        ]
         read_only_fields = ['voter', 'timestamp']
 
+    def validate(self, attrs):
+        """
+        Guardrails:
+        - candidate must belong to election
+        """
+        election = attrs.get('election')
+        candidate = attrs.get('candidate')
+        if election and candidate and candidate.election_id != election.id:
+            raise serializers.ValidationError(
+                {'candidate': 'Selected candidate does not belong to this election.'}
+            )
+        return attrs
 
-# --- Notifications ---
+
+# ---------- Notifications ----------
 class NotificationSerializer(serializers.ModelSerializer):
     recipient = serializers.PrimaryKeyRelatedField(read_only=True)
     recipient_username = serializers.CharField(source="recipient.username", read_only=True)

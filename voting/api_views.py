@@ -3,26 +3,31 @@
 from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
 from rest_framework import viewsets, status
 from rest_framework.response import Response
-from rest_framework.decorators import action
-from .models import Election, Candidate, Vote, VoteAuditLog, Category, Notification
-from .serializers import ElectionSerializer, CandidateSerializer, VoteSerializer, CategorySerializer, NotificationSerializer
-from django.db.models import Q
-from datetime import timezone
+from rest_framework.decorators import action, api_view, permission_classes
+from django.utils import timezone
+from django.db.models import Count
+from django.db import IntegrityError
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
-from .permissions import IsAdminUser, IsElectionCreator, IsVoter, IsAdminOrModerator
-from rest_framework.decorators import api_view, permission_classes
-from accounts.models import CustomUser  # Assuming CustomUser is in accounts.models
-from django.db.models import Count
-import csv
 from django.http import HttpResponse
-from reportlab.pdfgen import canvas
-from io import BytesIO
-from rest_framework.throttling import ScopedRateThrottle
 from django.utils.translation import gettext as _
+import csv
+from io import BytesIO
+from reportlab.pdfgen import canvas
+from rest_framework.throttling import ScopedRateThrottle
+
+from .models import (
+    Election, Candidate, Vote, VoteAuditLog, Category, Notification
+)
+from .serializers import (
+    ElectionSerializer, CandidateSerializer, VoteSerializer,
+    CategorySerializer, NotificationSerializer
+)
+from .permissions import IsAdminUser, IsElectionCreator, IsVoter, IsAdminOrModerator
+from accounts.models import CustomUser
 
 
-
+# -------------------- Elections --------------------
 class ElectionViewSet(viewsets.ModelViewSet):
     serializer_class = ElectionSerializer
 
@@ -113,13 +118,10 @@ class ElectionViewSet(viewsets.ModelViewSet):
         election = self.get_object()
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = f'attachment; filename="{election.title}_results.csv"'
-
         writer = csv.writer(response)
         writer.writerow(['Candidate', 'Party', 'Votes'])
-
         for candidate in election.candidates.all():
             writer.writerow([candidate.name, candidate.party, candidate.votes_count])
-
         return response
 
     @action(detail=True, methods=['get'], permission_classes=[IsAdminUser])
@@ -128,22 +130,18 @@ class ElectionViewSet(viewsets.ModelViewSet):
         buffer = BytesIO()
         p = canvas.Canvas(buffer)
         p.setFont("Helvetica", 14)
-
         p.drawString(100, 800, f"Election Results: {election.title}")
         y = 760
         p.setFont("Helvetica", 12)
         p.drawString(100, y, "Candidate       |       Party       |       Votes")
         y -= 20
-
         for candidate in election.candidates.all():
             line = f"{candidate.name}       |       {candidate.party}       |       {candidate.votes_count}"
             p.drawString(100, y, line)
             y -= 20
-
         p.showPage()
         p.save()
         buffer.seek(0)
-
         return HttpResponse(buffer, content_type='application/pdf')
 
     @action(detail=True, methods=['get'], url_path='results')
@@ -154,8 +152,10 @@ class ElectionViewSet(viewsets.ModelViewSet):
         election.lock_if_ended()
 
         if not election.show_results_immediately and timezone.now() < election.end_date:
-            return Response({'detail': 'Results will be available after the election ends.'},
-                            status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {'detail': 'Results will be available after the election ends.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
         candidates = election.candidates.all()
         total_votes = sum(c.votes_count for c in candidates)
@@ -180,6 +180,7 @@ class ElectionViewSet(viewsets.ModelViewSet):
         })
 
 
+# -------------------- Candidates --------------------
 class CandidateViewSet(viewsets.ModelViewSet):
     queryset = Candidate.objects.all()
     serializer_class = CandidateSerializer
@@ -189,9 +190,7 @@ class CandidateViewSet(viewsets.ModelViewSet):
             return [IsElectionCreator()]
         elif self.action in ['update', 'partial_update', 'destroy']:
             return [IsAdminUser()]
-        elif self.action in [
-            'deactivate', 'flag', 'unflag', 'mark_reviewed', 'mark_unreviewed'
-        ]:
+        elif self.action in ['deactivate', 'flag', 'unflag', 'mark_reviewed', 'mark_unreviewed']:
             return [IsAdminOrModerator()]
         return [IsAuthenticatedOrReadOnly()]
 
@@ -240,6 +239,7 @@ class CandidateViewSet(viewsets.ModelViewSet):
         return Response({'status': 'Candidate marked as unreviewed'})
 
 
+# -------------------- Votes --------------------
 class VoteViewSet(viewsets.ModelViewSet):
     queryset = Vote.objects.all()
     serializer_class = VoteSerializer
@@ -247,50 +247,96 @@ class VoteViewSet(viewsets.ModelViewSet):
     throttle_scope = 'vote'
 
     def get_permissions(self):
+        # Keep your custom IsVoter for create (should allow guests when permitted)
         if self.action == 'create':
             return [IsVoter()]
         return [IsAuthenticated()]
 
     def get_queryset(self):
+        # Users see their own votes
         return Vote.objects.filter(voter=self.request.user)
 
     def create(self, request, *args, **kwargs):
         user = request.user if request.user.is_authenticated else None
         election_id = request.data.get('election')
-        comment = request.data.get('comment', '')
+        candidate_id = request.data.get('candidate')
+        comment = (request.data.get('comment') or '').strip()
+        device_fp = (request.data.get('device_fingerprint') or '').strip()
 
+        # Election
         try:
             election = Election.objects.get(id=election_id)
         except Election.DoesNotExist:
             return Response({'detail': 'Election does not exist.'}, status=status.HTTP_404_NOT_FOUND)
 
+        # Voting window
         now = timezone.now()
         if now < election.start_date or now > election.end_date:
-            return Response({'detail': 'Voting is not allowed outside the election period.'},
-                            status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {'detail': 'Voting is not allowed outside the election period.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
-        if not election.allow_anonymous:
-            if not request.user.is_authenticated:
-                return Response({'detail': 'Authentication required to vote.'}, status=status.HTTP_401_UNAUTHORIZED)
+        # Candidate sanity: must belong to this election
+        try:
+            candidate = Candidate.objects.get(id=candidate_id, election=election)
+        except Candidate.DoesNotExist:
+            return Response({'detail': 'Candidate not found for this election.'},
+                            status=status.HTTP_400_BAD_REQUEST)
 
-            if Vote.objects.filter(voter=request.user, election=election).exists():
-                return Response({'detail': 'You have already voted in this election.'},
-                                status=status.HTTP_400_BAD_REQUEST)
-
+        # Comment requirement
         if election.allow_vote_comments and not comment:
             return Response({'detail': 'A comment is required for this vote.'},
                             status=status.HTTP_400_BAD_REQUEST)
 
+        # Duplicate blocking rules
+        # 1) Logged-in users: always one vote per election (even if allow_anonymous=True)
+        if user and Vote.objects.filter(voter=user, election=election).exists():
+            return Response({'detail': 'You have already voted in this election.'},
+                            status=status.HTTP_409_CONFLICT)
+
+        # 2) Guests: require fingerprint and dedupe by fingerprint
+        if not user:
+            if not election.allow_anonymous:
+                return Response({'detail': 'Authentication required to vote.'},
+                                status=status.HTTP_401_UNAUTHORIZED)
+            if not device_fp:
+                return Response({'detail': 'Device fingerprint is required for anonymous voting.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            if Vote.objects.filter(election=election, device_fingerprint=device_fp).exists():
+                return Response({'detail': 'This device has already voted in this election.'},
+                                status=status.HTTP_409_CONFLICT)
+
+        # Stash for perform_create
         request._election = election
-        return super().create(request, *args, **kwargs)
+        request._candidate = candidate
+        request._comment = comment
+        request._device_fp = device_fp
+        request._voter = user  # may be None (guest)
+
+        try:
+            return super().create(request, *args, **kwargs)
+        except IntegrityError:
+            # Covers race conditions with unique constraints (voter+election or election+fingerprint)
+            return Response({'detail': 'Duplicate vote detected.'}, status=status.HTTP_409_CONFLICT)
 
     def perform_create(self, serializer):
         election = getattr(self.request, '_election', None)
-        comment = self.request.data.get('comment', '')
-        voter = None if election and election.allow_anonymous else self.request.user
-        vote = serializer.save(voter=voter, comment=comment)
+        candidate = getattr(self.request, '_candidate', None)
+        comment = getattr(self.request, '_comment', '')
+        device_fp = getattr(self.request, '_device_fp', '')
+        voter = getattr(self.request, '_voter', None)
 
-        # Create audit log
+        # Always attribute vote to the user when authenticated; guests get voter=None
+        vote = serializer.save(
+            voter=voter,
+            election=election,
+            candidate=candidate,
+            comment=comment,
+            device_fingerprint=(device_fp or None),
+        )
+
+        # Audit log
         VoteAuditLog.objects.create(
             voter=voter,
             election=vote.election,
@@ -299,38 +345,38 @@ class VoteViewSet(viewsets.ModelViewSet):
             comment_snapshot=vote.comment
         )
 
-        # Setup WebSocket layer
+        # Push a live update via channels (if configured)
         channel_layer = get_channel_layer()
-
-        # Send live vote update to election group
-        async_to_sync(channel_layer.group_send)(
-            f"election_{election.id}",
-            {
-                "type": "vote_update",
-                "data": {
-                    "candidate_id": vote.candidate.id,
-                    "total_votes": vote.candidate.votes_count
+        if channel_layer:
+            async_to_sync(channel_layer.group_send)(
+                f"election_{election.id}",
+                {
+                    "type": "vote_update",
+                    "data": {
+                        "candidate_id": vote.candidate.id,
+                        "total_votes": vote.candidate.votes_count
+                    }
                 }
-            }
-        )
+            )
 
-        # Create notification and push it via WebSocket
+        # Notify authenticated voters
         if voter:
             Notification.objects.create(
                 recipient=voter,
                 message=f"Your vote for '{vote.candidate.name}' in '{vote.election.title}' was recorded."
             )
+            if channel_layer:
+                async_to_sync(channel_layer.group_send)(
+                    f"user_{voter.id}",
+                    {
+                        "type": "notification_message",
+                        "message": f"Your vote for '{vote.candidate.name}' in '{vote.election.title}' was recorded.",
+                        "link": f"/elections/{vote.election.id}/results/"
+                    }
+                )
 
-            async_to_sync(channel_layer.group_send)(
-                f"user_{voter.id}",
-                {
-                    "type": "notification_message",
-                    "message": f"Your vote for '{vote.candidate.name}' in '{vote.election.title}' was recorded.",
-                    "link": f"/elections/{vote.election.id}/results/"
-                }
-            )
 
-
+# -------------------- Categories --------------------
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
@@ -341,6 +387,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
         return [IsAuthenticatedOrReadOnly()]
 
 
+# -------------------- Notifications --------------------
 class NotificationViewSet(viewsets.ModelViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [IsAuthenticated]
@@ -361,7 +408,7 @@ class NotificationViewSet(viewsets.ModelViewSet):
         return Response({'status': 'All notifications marked as read'})
 
 
-
+# -------------------- Admin Stats --------------------
 @api_view(['GET'])
 @permission_classes([IsAdminUser])
 def admin_stats(request):
