@@ -17,6 +17,7 @@ services:
     startCommand: |
       export DJANGO_SETTINGS_MODULE=VotingSphere.settings.prod
       python manage.py migrate --noinput && \
+      python manage.py createsuperuser --noinput || true
       daphne -b 0.0.0.0 -p $PORT VotingSphere.asgi:application
 
     envVars:
