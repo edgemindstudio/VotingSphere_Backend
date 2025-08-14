@@ -2,6 +2,41 @@
 .env
 .env.local
 .env.*
+.venv
+.venv.*
+
 # but track the template
 !.env.example
+# Python / Django
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.log
+*.pot
+*.pyc
+
+db.sqlite3
+
+# Django collectstatic output & uploads
+staticfiles/
+media/
+
+# Byte-compiled / cache
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Migrations: KEEP them, don't ignore
+# voting/migrations/ is tracked
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Node / Flutter artifacts if present in this repo
+node_modules/
+build/
+
 

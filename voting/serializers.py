@@ -33,13 +33,13 @@ class CandidateSerializer(serializers.ModelSerializer):
 class ElectionSerializer(serializers.ModelSerializer):
     candidates = CandidateSerializer(many=True, read_only=True)
 
-    # CHANGED: accept category by primary key (id) for writes
+    # Accept category by primary key (id) for writes
     category = serializers.PrimaryKeyRelatedField(
         queryset=Category.objects.all(),
         required=False,
         allow_null=True,
     )
-    # Optional convenience: include the category name in responses
+    # Convenience: include category name in responses
     category_name = serializers.CharField(source='category.name', read_only=True)
 
     class Meta:
@@ -64,9 +64,12 @@ class ElectionSerializer(serializers.ModelSerializer):
 
 # ---------- Votes ----------
 class VoteSerializer(serializers.ModelSerializer):
-    # Accept the fingerprint the frontend sends (used to dedupe guests)
+    # Optional for guests only; ignored for logged-in users
     device_fingerprint = serializers.CharField(
-        max_length=64, allow_blank=True, required=False
+        max_length=64,
+        required=False,
+        allow_blank=True,
+        allow_null=True,
     )
 
     class Meta:
@@ -81,11 +84,14 @@ class VoteSerializer(serializers.ModelSerializer):
             'device_fingerprint',
         ]
         read_only_fields = ['voter', 'timestamp']
+        extra_kwargs = {
+            # Belt & suspenders: force optional at DRF level even if model says otherwise
+            'device_fingerprint': {'required': False, 'allow_null': True, 'allow_blank': True},
+        }
 
     def validate(self, attrs):
         """
-        Guardrails:
-        - candidate must belong to election
+        Guardrails: candidate must belong to election.
         """
         election = attrs.get('election')
         candidate = attrs.get('candidate')

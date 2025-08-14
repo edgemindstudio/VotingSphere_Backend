@@ -11,14 +11,12 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.http import HttpResponse
 from django.utils.translation import gettext as _
-import csv
 from io import BytesIO
+import csv
 from reportlab.pdfgen import canvas
 from rest_framework.throttling import ScopedRateThrottle
 
-from .models import (
-    Election, Candidate, Vote, VoteAuditLog, Category, Notification
-)
+from .models import Election, Candidate, Vote, VoteAuditLog, Category, Notification
 from .serializers import (
     ElectionSerializer, CandidateSerializer, VoteSerializer,
     CategorySerializer, NotificationSerializer
@@ -247,7 +245,7 @@ class VoteViewSet(viewsets.ModelViewSet):
     throttle_scope = 'vote'
 
     def get_permissions(self):
-        # Keep your custom IsVoter for create (should allow guests when permitted)
+        # Allow guests to create votes when permitted by the election
         if self.action == 'create':
             return [IsVoter()]
         return [IsAuthenticated()]
@@ -261,15 +259,15 @@ class VoteViewSet(viewsets.ModelViewSet):
         election_id = request.data.get('election')
         candidate_id = request.data.get('candidate')
         comment = (request.data.get('comment') or '').strip()
-        device_fp = (request.data.get('device_fingerprint') or '').strip()
+        fingerprint = (request.data.get('device_fingerprint') or '').strip()
 
-        # Election
+        # 1) Load election
         try:
             election = Election.objects.get(id=election_id)
         except Election.DoesNotExist:
             return Response({'detail': 'Election does not exist.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Voting window
+        # 2) Voting window
         now = timezone.now()
         if now < election.start_date or now > election.end_date:
             return Response(
@@ -277,63 +275,81 @@ class VoteViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # Candidate sanity: must belong to this election
+        # 3) Candidate must belong
         try:
             candidate = Candidate.objects.get(id=candidate_id, election=election)
         except Candidate.DoesNotExist:
             return Response({'detail': 'Candidate not found for this election.'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # Comment requirement
+        # 4) Comment requirement (if enabled)
         if election.allow_vote_comments and not comment:
             return Response({'detail': 'A comment is required for this vote.'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # Duplicate blocking rules
-        # 1) Logged-in users: always one vote per election (even if allow_anonymous=True)
+        # 5) Duplicate rules
+        # Logged-in: always block second vote (even if allow_anonymous=True)
         if user and Vote.objects.filter(voter=user, election=election).exists():
             return Response({'detail': 'You have already voted in this election.'},
                             status=status.HTTP_409_CONFLICT)
 
-        # 2) Guests: require fingerprint and dedupe by fingerprint
+        # Guests: require fingerprint and dedupe per election+fingerprint
         if not user:
             if not election.allow_anonymous:
                 return Response({'detail': 'Authentication required to vote.'},
                                 status=status.HTTP_401_UNAUTHORIZED)
-            if not device_fp:
-                return Response({'detail': 'Device fingerprint is required for anonymous voting.'},
+            if not fingerprint:
+                return Response({'device_fingerprint': ['This field is required for anonymous votes.']},
                                 status=status.HTTP_400_BAD_REQUEST)
-            if Vote.objects.filter(election=election, device_fingerprint=device_fp).exists():
+            if Vote.objects.filter(election=election, device_fingerprint=fingerprint).exists():
                 return Response({'detail': 'This device has already voted in this election.'},
                                 status=status.HTTP_409_CONFLICT)
+
+        # 6) Build the serializer payload explicitly (don’t trust raw request.data)
+        payload = {
+            "election": election.id,
+            "candidate": candidate.id,
+            "comment": comment,
+            "device_fingerprint": (fingerprint or None),  # <-- always include, None for logged-in
+        }
+        # # Only include fingerprint for guests
+        # if user is None:
+        #     payload["device_fingerprint"] = fingerprint
+
+        serializer = self.get_serializer(data=payload)
+        serializer.is_valid(raise_exception=True)
 
         # Stash for perform_create
         request._election = election
         request._candidate = candidate
         request._comment = comment
-        request._device_fp = device_fp
-        request._voter = user  # may be None (guest)
+        request._fingerprint = fingerprint
+        request._voter = user
 
         try:
-            return super().create(request, *args, **kwargs)
+            self.perform_create(serializer)
         except IntegrityError:
-            # Covers race conditions with unique constraints (voter+election or election+fingerprint)
-            return Response({'detail': 'Duplicate vote detected.'}, status=status.HTTP_409_CONFLICT)
+            # In case of race conditions with unique constraints
+            return Response({'detail': 'Duplicate vote detected.'},
+                            status=status.HTTP_409_CONFLICT)
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_create(self, serializer):
         election = getattr(self.request, '_election', None)
         candidate = getattr(self.request, '_candidate', None)
         comment = getattr(self.request, '_comment', '')
-        device_fp = getattr(self.request, '_device_fp', '')
+        fingerprint = getattr(self.request, '_fingerprint', '') or None
         voter = getattr(self.request, '_voter', None)
 
-        # Always attribute vote to the user when authenticated; guests get voter=None
+        # Persist with explicit relations (prevents client tampering)
         vote = serializer.save(
             voter=voter,
             election=election,
             candidate=candidate,
             comment=comment,
-            device_fingerprint=(device_fp or None),
+            device_fingerprint=fingerprint,
         )
 
         # Audit log
@@ -345,7 +361,7 @@ class VoteViewSet(viewsets.ModelViewSet):
             comment_snapshot=vote.comment
         )
 
-        # Push a live update via channels (if configured)
+        # Live update
         channel_layer = get_channel_layer()
         if channel_layer:
             async_to_sync(channel_layer.group_send)(
