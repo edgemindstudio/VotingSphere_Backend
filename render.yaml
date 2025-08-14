@@ -39,18 +39,12 @@ services:
       - key: JWT_REFRESH_DAYS
         value: "10"
 
-#      # Managed Redis (Render Key Value) — must be under `services`
-#      - type: keyvalue              # `redis` is a deprecated alias
-#        name: votingsphere-redis
-#        plan: free
-#        ipAllowList: [ ]             # required; empty list = internal-only
+      # Managed Redis (Render Key Value) — must be under `services`
+      - type: keyvalue              # `redis` is a deprecated alias
+        name: votingsphere-redis
+        plan: free
+        ipAllowList: [ ]             # required; empty list = internal-only
 
 databases:
   - name: votingsphere-pg
     plan: free
-
-# Managed Redis for Channels
-# (Render 'redis' services are listed under services, not databases)
-- type: redis
-  name: votingsphere-redis
-  plan: free
